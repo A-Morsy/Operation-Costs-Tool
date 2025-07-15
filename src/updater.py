@@ -104,8 +104,8 @@ class EmployeeCostMapper:
 
 
 if __name__ == "__main__":
-    TARGET_FILE = "target_sheet.xlsx"
-    PROCESSED_FILE = "processed_timesheet.xlsx"
+    TARGET_FILE = "../docs/target_sheet.xlsx"
+    PROCESSED_FILE = "../docs/processed_timesheet.xlsx"
     SHEET_NAME = "Project"
 
     # rows to skip 

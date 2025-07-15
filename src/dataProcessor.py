@@ -10,7 +10,7 @@ class TimeSheetUpdater:
         self.source_data = None
         self.target_data = None
         
-        wb = load_workbook('target_sheet.xlsx')
+        wb = load_workbook('../docs/target_sheet.xlsx')
         # Updated work package mappings
         self.work_package_to_operation = {
             # Avature Crew packages
@@ -125,11 +125,11 @@ def main():
     try:
         # Process the source data
         print("Processing data...")
-        processed_data = updater.load_and_process_data('source_timesheet.xlsx')
+        processed_data = updater.load_and_process_data('../docs/source_timesheet.xlsx')
         
         # Save the processed data
         print("\nSaving processed data...")
-        updater.save_processed_data(processed_data, 'processed_timesheet.xlsx')
+        updater.save_processed_data(processed_data, '../docs/processed_timesheet.xlsx')
         
         print("\nProcess completed successfully!")
         
