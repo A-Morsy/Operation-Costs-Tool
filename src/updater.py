@@ -2,21 +2,29 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font
+from name_mappings import ALIAS_TO_CANONICAL, normalize_name, SKIP_NAMES
+import os
 
 class EmployeeCostMapper:
     def __init__(self, target_path, processed_path, target_sheet='Project', skip_names=None):
         self.target_path = target_path
         self.processed_path = processed_path
         self.target_sheet = target_sheet
+        self.normalize_name = normalize_name
         self.processed_df = pd.read_excel(self.processed_path)
-        self.wb = load_workbook(self.target_path)
+        # Load workbook for updating (formulas)
+        self.wb = load_workbook(self.target_path,data_only=True)
         self.ws = self.wb[self.target_sheet]
+        # Load workbook for values (data_only=True)
+        self.wb_values = load_workbook(self.target_path, data_only=True)
+        self.ws_values = self.wb_values[self.target_sheet]
         self.month_col_map = self._map_month_columns()
         self.operation_names = set(self.processed_df['Operation'].unique())
         self.processed_df['Name_norm'] = self.processed_df['Name'].apply(self.normalize_name)
         self.processed_df['Operation_norm'] = self.processed_df['Operation'].str.strip()
         self.skip_names = set(n.strip().lower() for n in (skip_names or []))
         self.mapping = []
+        
 
     def _map_month_columns(self):
         """Map month names to their column indices."""
@@ -41,6 +49,7 @@ class EmployeeCostMapper:
         return value and str(value).strip().lower() in self.skip_names
 
     def map_employees(self):
+        self.cell_audit_log = []
         current_operation = None
         for row in range(2, self.ws.max_row + 1):
             cell_value = self.ws.cell(row=row, column=5).value  # Column E
@@ -55,7 +64,6 @@ class EmployeeCostMapper:
                 current_operation = str(cell_value).strip()
                 continue
 
-            # Skip if not in an operation section
             if not current_operation:
                 continue
 
@@ -63,170 +71,79 @@ class EmployeeCostMapper:
             if not emp_name or emp_name.strip() == '' or self._is_operation(emp_name) or self._should_skip(emp_name):
                 continue
 
-            # For each month, get current value and cell address
             for period, col in self.month_col_map.items():
                 cell = self.ws.cell(row=row, column=col)
                 cell_address = f"{get_column_letter(col)}{row}"
-                self.mapping.append({
+                # Use the value from the value-only workbook for Fees_before
+                before_val = self.ws_values.cell(row=row, column=col).value
+                # Set Fees_before to -1 if missing
+                if before_val is None or (isinstance(before_val, float) and pd.isna(before_val)):
+                    before_val = -1
+
+                # Store BEFORE update. After update will be filled in next step.
+                self.cell_audit_log.append({
                     'Operation': current_operation,
                     'Employee': emp_name.strip(),
                     'Month': period,
                     'Cell': cell_address,
-                    'CurrentValue': cell.value
+                    'Fees_before': before_val,
+                    'Fees_after': None  # Filled after updating
                 })
-
-    def normalize_name(self,name):
-        if not name:
-            return None
-        return ALIAS_TO_CANONICAL.get(name.strip().lower(), name.strip())
-
+        # Done mapping! self.cell_audit_log = full before-state
 
     def update_costs(self):
         orange_font = Font(color="FFA500")
         update_count = 0
-        for entry in self.mapping:
+        for entry in self.cell_audit_log:
             # Find the correct fee in the processed DataFrame
             mask = (
-                (self.processed_df['Operation'] == entry['Operation']) &
+                (self.processed_df['Operation_norm'] == entry['Operation']) &
                 (self.processed_df['Name_norm'] == entry['Employee']) &
-                (self.processed_df['StartDate'].str.startswith(entry['Month']))
+                (self.processed_df['Month'] == entry['Month'])
             )
             match = self.processed_df[mask]
             if not match.empty:
                 fee = match['Fees'].values[0]
                 cell = self.ws[entry['Cell']]
+                prev_val = cell.value
                 cell.value = fee
                 cell.font = orange_font
                 update_count += 1
+                # Record the after value
+                entry['Fees_after'] = fee if fee is not None and not (isinstance(fee, float) and pd.isna(fee)) else -1
+            else:
+                # No match in processed data: Fees_after should be -1 to indicate missing
+                entry['Fees_after'] = -1
         print(f"Updated {update_count} cells with new costs (highlighted in orange).")
-        # Save the workbook
         self.wb.save(self.target_path.replace('.xlsx', '_updated.xlsx'))
+
+    def save_audit_chunks(self, output_dir="../chunks/target_chunks"):
+        """Save audit log as chunks (by operation/project) with before/after fees."""
+        all_df = pd.DataFrame(self.cell_audit_log)
+        os.makedirs(output_dir, exist_ok=True)
+        for op, chunk in all_df.groupby('Operation'):
+            # Remove rows with NaN in Fees_before or Fees_after before saving
+            chunk_clean = chunk.dropna(subset=['Fees_before', 'Fees_after'])
+            safe_op = op.replace(' ', '_').replace('/', '_')
+            path = os.path.join(output_dir, f"[audit]_{safe_op}.xlsx")
+            chunk_clean.to_excel(path, index=False)
+            print(f"Saved audit chunk: {path}")
 
 
 if __name__ == "__main__":
-    TARGET_FILE = "../docs/target_sheet.xlsx"
-    PROCESSED_FILE = "../docs/processed_timesheet.xlsx"
+    import sys
+    # Get absolute paths relative to this script's directory
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    TARGET_FILE = os.path.abspath(os.path.join(BASE_DIR, "../docs/target_sheet.xlsx"))
+    PROCESSED_FILE = os.path.abspath(os.path.join(BASE_DIR, "../docs/processed_timesheet.xlsx"))
     SHEET_NAME = "Project"
 
-    # rows to skip 
-    SKIP_NAMES = [
-        "Test - ARE 5240", "Service Management - ARE 5290 + int.", "JCC",
-        "CHCM (Eviden)", "AWS Encryption Key (KMS for Eightfold; GBS)",
-        "DirX (Ext)/(SAG Global)", "Integrations DPS", "GBS total",
-        "TRE (Tupu) PO", "Eightfold (PO Q1/2025: 9708791569; Q2-Q4: tbd.)",
-        "Provider", "CERT check (pen GBS)", "Accessibility Test",
-        "Travel & Hospitality", "Additional costs", "Total Costs",
-        "Accumulated costs Eightfold Crew", "Service Management - ARE 5290 + int.",
-        "DirX PT -  5240", "DirX (Eviden)", "TRE (Tupu) (PO tbd)", "Eightfold",
-        "Avature DT (PO 9708872111)", "Avature AM (PO 9708872111)",
-        "Avature Healthcheck (PO", "Total costs", "Accumulated costs Avature Crew",
-        "CHCM (Evdien)", "Avature ext. Careers Portal (PO 9709043748) - PDP",
-        "Avature ext. Careers Portal (PO 9709132497)", "Travel & Hospitality ext. Provider",
-        "Travel & Hospitality DE", "Travel & Hospitality ES / CZ / PT",
-        "Total costs", "Accumulated costs Ext. Careers Port Crew", "Accumulated costs Preboarding",
-        "Service Management","Total","Avature","DPS Internal Umlage (global)"
-    ]
+    # Print working directory and resolved paths for debug purposes
+    print(f"Current working directory: {os.getcwd()}")
+    print(f"Resolved TARGET_FILE: {TARGET_FILE}")
+    print(f"Resolved PROCESSED_FILE: {PROCESSED_FILE}")
 
-    NAME_MAP = {
-    "Assuncao Gambetta Clemente, Fernanda": [
-        "Assuncao Gambetta Clemente, Fernanda",
-        "Fernanda Assuncao Gambetta Clemente",
-    ],
-    "Magro, Daniel": [
-        "Magro, Daniel",
-    ],
-    "Pires Rosa, Claudia": [
-        "Pires Rosa, Claudia",
-        "Claudia Pires Rosa",
-        "Rosa, Claudia (ext)",
-        "Pires Rosa, Claudia (ext)",
-        "Claudia Rosa",
-    ],
-    "Helbing, Björn": [
-        "Helbing, Björn",
-        "Helbing, Bjoern",
-        "B. Helbing",
-        "Björn Helbing",
-    ],
-    "Matos Oliveira, Ana Rita": [
-        "Matos Oliveira, Ana Rita",
-        "Ana Rita Matos Oliveira",
-        "Matos dos Santos Oliveira, Ana Rita",
-        "Matos Oliveira, Rita",
-    ],
-    "Pires, Filipe": [
-        "Pires, Filipe",
-        "Guerreiro Luis Pires, Filipe Viegas",
-        "Filipe Pires",
-    ],
-    "Plácido, Andreia": [
-        "Plácido, Andreia",
-        "Moreira Cristo Placido, Andreia Sofia",
-        "Andreia Plácido",
-        "Andreia Sofia Moreira Cristo Placido",
-    ],
-    "Antunes, Ricardo": [
-        "Antunes, Ricardo",
-        "Ricardo Antunes",
-    ],
-    "Fernandes Redondo, Amanda": [
-        "Fernandes Redondo, Amanda",
-        "Amanda Fernandes Redondo",
-        "Fernandez Redondo, Amanda",
-    ],
-    "Zouine, Meryem": [
-        "Zouine, Meryem",
-        "Meryem Zouine",
-    ],
-    "Cerezo, Alberto": [
-        "Cerezo, Alberto",
-        "Cerezo Ruiz, Alberto",
-        "Alberto Cerezo",
-    ],
-    "Swoboda, Claudia": [
-        "Swoboda, Claudia",
-        "Claudia Swoboda",
-    ],
-    "Bicho, Rita": [
-        "Bicho, Rita",
-        "Lazaro Bicho, Rita Sofia",
-        "Rita Bicho",
-        "Rita Sofia Lazaro Bicho",
-    ],
-    "Lopes Fonseca, Mario Andre": [
-        "Lopes Fonseca, Mario Andre",
-        "Mario Andre Lopes Fonseca",
-    ],
-    "Wiesheu, Andreas": [
-        "Wiesheu, Andreas",
-        "Andreas Wiesheu",
-    ],
-    "Heldwein, Christian": [
-        "Heldwein, Christian",
-        "Christian Heldwein",
-    ],
-    "Hernandes Vaz, Joao Rafael": [
-        "Hernandes Vaz, Joao Rafael",
-        "Joao Rafael Hernandes Vaz",
-    ],
-    "Vitorino, Diana": [
-        "Vitorino, Diana",
-        "Diana Vitorino",
-    ],
-    "Candeias Gracioso, Sara Margarida": [
-        "Candeias Gracioso, Sara Margarida",
-        "Sara Margarida Candeias Gracioso",
-    ],
-    "do Nascimento Matos Manso, Rui Pedro": [
-        "do Nascimento Matos Manso, Rui Pedro",
-        "Rui Pedro do Nascimento Matos Manso",
-    ],
-}
-ALIAS_TO_CANONICAL = {}
-for canonical, aliases in NAME_MAP.items():
-    for alias in aliases:
-        ALIAS_TO_CANONICAL[alias.strip().lower()] = canonical
-    
-mapper = EmployeeCostMapper(TARGET_FILE, PROCESSED_FILE, SHEET_NAME, SKIP_NAMES)
-mapper.map_employees()
-mapper.update_costs()
+    mapper = EmployeeCostMapper(TARGET_FILE, PROCESSED_FILE, SHEET_NAME, SKIP_NAMES)
+    mapper.map_employees()
+    mapper.update_costs()
+    mapper.save_audit_chunks()

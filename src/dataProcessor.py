@@ -3,6 +3,9 @@ import pandas as pd
 import math
 from openpyxl import load_workbook
 
+from name_mappings import ALIAS_TO_CANONICAL
+from chunk_handler import ChunkHandler
+
 locale.setlocale(locale.LC_ALL, 'de_DE.UTF-8')
 
 class TimeSheetUpdater:
@@ -10,7 +13,6 @@ class TimeSheetUpdater:
         self.source_data = None
         self.target_data = None
         
-        wb = load_workbook('../docs/target_sheet.xlsx')
         # Updated work package mappings
         self.work_package_to_operation = {
             # Avature Crew packages
@@ -82,15 +84,56 @@ class TimeSheetUpdater:
         ).apply(lambda x: x.strftime('%Y-%m')))
 
         processed_data['Fees'] = processed_data['Fees'].apply(lambda x: self.custom_round(x))
-        
 
         # Sort the data
         processed_data = processed_data.sort_values(
             ['Operation', 'Name', 'StartDate'],
-            ascending=[False,True,True]
+            ascending=[False, True, True]
         ).reset_index(drop=True)
         
-        return processed_data
+        # Save processed dataframe for chunking
+        self.processed_df = processed_data
+        
+        handler = ChunkHandler(self.processed_df, self.normalize_name)
+        handler.save_chunks("../chunks/processed_chunks", filename_prefix="processed")
+        return self.processed_df
+
+    def get_operation_chunks(self):
+        """Yield dataframes grouped by each unique Operation."""
+        if not hasattr(self, 'processed_df'):
+            raise AttributeError("processed_df not found. Please run load_and_process_data first.")
+            
+        for operation, chunk_df in self.processed_df.groupby('Operation'):
+            yield operation, chunk_df.copy()
+
+    def process_operation_chunk(self, operation, chunk_df):
+        """Process a chunk of data for a given operation.
+
+        Apply normalization, filtering, chunk-level processing here.
+        """
+        # Normalize names in this chunk
+        chunk_df['Name_norm'] = chunk_df['Name'].apply(self.normalize_name)
+        chunk_df['Operation_norm'] = chunk_df['Operation'].str.strip()
+        chunk_df['StartDate'] = pd.to_datetime(chunk_df['StartDate'], errors='coerce')
+        chunk_df['Month'] = chunk_df['StartDate'].dt.strftime('%Y-%m')
+
+        return chunk_df
+
+    def process_all_chunks(self):
+        """Process all operation chunks and return concatenated DataFrame."""
+        all_processed_chunks = []
+        for operation, chunk_df in self.get_operation_chunks():
+            print(f"Processing chunk: {operation} with {len(chunk_df)} rows")
+            processed_chunk = self.process_operation_chunk(operation, chunk_df)
+            all_processed_chunks.append(processed_chunk)
+        self.processed_df = pd.concat(all_processed_chunks, ignore_index=True)
+        print(f"All chunks processed. Total rows: {len(self.processed_df)}")
+        return self.processed_df
+
+    def normalize_name(self, name):
+        if not name:
+            return None
+        return ALIAS_TO_CANONICAL.get(name.strip().lower(), name.strip())
 
     def save_processed_data(self, data, output_path):
         """Save the processed data to Excel"""
@@ -123,13 +166,16 @@ def main():
     updater = TimeSheetUpdater()
     
     try:
-        # Process the source data
-        print("Processing data...")
-        processed_data = updater.load_and_process_data('../docs/source_timesheet.xlsx')
+        print("Loading and processing data...")
+        updater.load_and_process_data('../docs/source_timesheet.xlsx')
         
-        # Save the processed data
+        # Process chunks now
+        print("Processing data in chunks...")
+        processed_df = updater.process_all_chunks()
+        
+        # Save processed data after chunk processing
         print("\nSaving processed data...")
-        updater.save_processed_data(processed_data, '../docs/processed_timesheet.xlsx')
+        updater.save_processed_data(processed_df, '../docs/processed_timesheet.xlsx')
         
         print("\nProcess completed successfully!")
         
